@@ -165,17 +165,18 @@ class MediaTagManager:
             self.add_file_to_tree(file_path)
 
     def add_file_to_tree(self, file_path):
-        # Helper to add one file (used by both normal load and filtering)
+        # Use full path as key
+        key = str(file_path)
         try:
-            thumb = self.thumbnails.get(file_path.name)
+            thumb = self.thumbnails.get(key)  # ← CHANGE: use key, not file_path.name
             if not thumb:
                 thumb = self.generate_thumbnail(file_path, size=120)
-                self.thumbnails[file_path.name] = thumb
+                self.thumbnails[key] = thumb
         except:
             thumb = None
 
         display_name = str(file_path.relative_to(self.directory)) if hasattr(self, 'directory') else file_path.name
-        iid = str(file_path)
+        iid = key
         self.file_tree.insert("", "end", iid=iid, text=display_name, image=thumb or "")
     
     def setup_ui(self):
@@ -405,23 +406,21 @@ class MediaTagManager:
 
         # Insert into Treeview with thumbnails
         for file_path in self.files:
-            key = str(file_path)  # ← FIXED: Use full path as key (no name collisions)
-
+            key = str(file_path)  # ← CHANGE: Use full path, not just .name
             try:
-                thumb = self.generate_thumbnail(file_path, size=120)  # Big thumbs!
+                thumb = self.generate_thumbnail(file_path, size=120)
                 large = self.generate_thumbnail(file_path, size=300, unrestricted=True)
             except Exception as e:
                 print(f"Thumbnail failed for {file_path}: {e}")
                 thumb = large = None
 
-            self.thumbnails[key] = thumb
+            self.thumbnails[key] = thumb          # ← Now safe
             self.large_thumbnails[key] = large
             if file_path.suffix.lower() in (".mp4", ".avi"):
-                self.video_thumbnails[key] = []  # ← FIXED: Use full path key
+                self.video_thumbnails[key] = []   # Already correct
 
             display_name = str(file_path.relative_to(self.directory)) if recursive else file_path.name
-            iid = key  # Use full path as Treeview ID too
-
+            iid = key
             self.file_tree.insert("", "end", iid=iid, text=display_name, image=thumb or "")
 
             # Load tags
