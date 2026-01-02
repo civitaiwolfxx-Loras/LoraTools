@@ -15,11 +15,12 @@ from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 
+FFMPEG = "ffmpeg"  # <-- This was missing!
 
 # ──────────────────────── Worker thread for merging (so UI stays responsive) ────────────────────────
 class MergeWorker(QThread):
-    finished = pyqtSignal(str)   # emits final file path
-    failed = pyqtSignal(str)     # emits error message
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
 
     def __init__(self, videos, target_res, output_path):
         super().__init__()
@@ -29,29 +30,73 @@ class MergeWorker(QThread):
 
     def run(self):
         try:
-            clips = []
+            if len(self.videos) == 0:
+                self.failed.emit("No videos to merge")
+                return
+
+            # Single video: lossless copy
+            if len(self.videos) == 1:
+                cmd = [
+                    FFMPEG, "-y",
+                    "-i", self.videos[0]["path"],
+                    "-c", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    self.output_path
+                ]
+                result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if result.returncode != 0:
+                    self.failed.emit(result.stderr.decode(errors="ignore"))
+                    return
+                self.finished.emit(self.output_path)
+                return
+
+            # Multiple videos: high-quality re-encode with scaling
             tw, th = self.target_res
-            for v in self.videos:
-                clip = v["clip"]
-                if v["res"] == self.target_res:
-                    clips.append(clip)
-                else:
-                    scale = min(tw / v["res"][0], th / v["res"][1])
-                    resized = clip.resize(width=int(v["res"][0] * scale))
-                    clips.append(resized.on_color(size=(tw, th), color=(0,0,0), pos="center"))
 
-            final = concatenate_videoclips(clips, method="compose")
-            final.write_videofile(self.output_path, codec="libx264", audio_codec="aac",
-                                 threads=os.cpu_count() or 4, preset="medium", verbose=False, logger=None)
+            # Build filter_complex
+            scale_pad_filters = []
+            for i in range(len(self.videos)):
+                scale_pad_filters.append(
+                    f"[{i}:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                    f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black[v{i}]"
+                )
 
-            # Clean up
+            concat_inputs = "".join(f"[v{i}]" for i in range(len(self.videos)))
+            filter_complex = ";".join(scale_pad_filters) + f";{concat_inputs}concat=n={len(self.videos)}:v=1:a=0[outv]"
+
+            # Build command with individual -i inputs
+            cmd = [FFMPEG, "-y"]
             for v in self.videos:
-                v["clip"].close()
-            final.close()
+                cmd += ["-i", v["path"]]
+
+            cmd += [
+                "-filter_complex", filter_complex,
+                "-map", "[outv]",
+                "-c:v", "libx264",
+                "-preset", "veryslow",
+                "-crf", "17",
+                "-pix_fmt", "yuv420p",
+                "-avoid_negative_ts", "make_zero",
+                self.output_path
+            ]
+
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            if result.returncode != 0:
+                error = result.stderr.decode(errors="ignore")
+                self.failed.emit(f"FFmpeg error: {error}")
+                return
 
             self.finished.emit(self.output_path)
+
         except Exception as e:
             self.failed.emit(str(e))
+        finally:
+            for v in self.videos:
+                try:
+                    v["clip"].close()
+                except:
+                    pass
 
 
 # ──────────────────────────────────────── Main Window ────────────────────────────────────────
