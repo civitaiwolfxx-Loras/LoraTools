@@ -17,6 +17,7 @@ import sys
 
 # ===================== CONFIG =====================
 CONFIG_FILE = Path(__file__).with_name("timeline_config.json")
+CACHE_FILE = Path(__file__).with_name("timeline_cache.json")
 THUMB_SIZE = (160, 160)
 NODE_WIDTH = 620
 NODE_HEIGHT = 300
@@ -47,7 +48,7 @@ def find_input_lastframe_png(workflow):
         if node.get("class_type") == "LoadImage":
             img = node["inputs"].get("image", "")
             if PNG_PATTERN.match(img):
-                return img
+                return Path(img).name  # Always use basename
     return None
 
 # ===================== FILE DATABASE =====================
@@ -58,48 +59,88 @@ class VideoDatabase:
         self.pred = {}
         self.succ = {}
 
-    def scan_folders(self, folders):
+    def scan_folders(self, folders, cache):
         self.mp4s.clear()
         self.pngs.clear()
+
+        current_folders = set(str(Path(f).resolve()) for f in folders)
+
+        # Clean cache for removed folders
+        for cached_folder in list(cache.keys()):
+            if cached_folder not in current_folders:
+                del cache[cached_folder]
+
         for folder_str in folders:
-            folder = Path(folder_str)
-            if not folder.is_dir():
-                continue
-            for path in folder.rglob("*.mp4"):
-                full_path = str(path.resolve())
-                ctime = path.stat().st_ctime
-                workflow = extract_workflow_from_mp4(full_path)
-                input_png = find_input_lastframe_png(workflow)
-                self.mp4s[full_path] = {
-                    "time": ctime,
-                    "workflow": workflow,
-                    "input_png": input_png
-                }
-            for path in folder.rglob("wan22_lastframe_*.png"):
-                self.pngs[path.name] = {
-                    "path": str(path.resolve()),
-                    "time": path.stat().st_ctime
-                }
+            folder = Path(folder_str).resolve()
+            folder_key = str(folder)
+            if folder_key not in cache:
+                cache[folder_key] = {"mp4s": {}, "pngs": {}}
+            folder_cache = cache[folder_key]
+
+            current_mp4 = {str(p.resolve()): p.stat().st_mtime for p in folder.rglob("*.mp4")}
+            current_png = {str(p.resolve()): p.stat().st_mtime for p in folder.rglob("wan22_lastframe_*.png")}
+
+            # Remove deleted
+            for path in list(folder_cache["mp4s"]):
+                if path not in current_mp4:
+                    del folder_cache["mp4s"][path]
+            for path in list(folder_cache["pngs"]):
+                if path not in current_png:
+                    del folder_cache["pngs"][path]
+
+            # MP4s
+            for path, mtime in current_mp4.items():
+                if path not in folder_cache["mp4s"] or folder_cache["mp4s"][path]["mtime"] != mtime:
+                    ctime = os.path.getctime(path)
+                    workflow = extract_workflow_from_mp4(path)
+                    input_png = find_input_lastframe_png(workflow)
+                    folder_cache["mp4s"][path] = {
+                        "time": ctime,
+                        "workflow": workflow,
+                        "input_png": input_png,
+                        "mtime": mtime
+                    }
+                self.mp4s[path] = folder_cache["mp4s"][path]
+
+            # PNGs
+            for path, mtime in current_png.items():
+                name = Path(path).name
+                if name not in folder_cache["pngs"] or folder_cache["pngs"][name]["mtime"] != mtime:
+                    folder_cache["pngs"][name] = {
+                        "path": path,
+                        "time": mtime,  # Use mtime for matching
+                        "mtime": mtime
+                    }
+                self.pngs[name] = folder_cache["pngs"][name]
+
         self.build_graph()
 
     def build_graph(self):
         self.pred.clear()
         self.succ.clear()
+
         for mp4_path, data in self.mp4s.items():
             input_png = data["input_png"]
             if not input_png or input_png not in self.pngs:
                 continue
-            png_time = self.pngs[input_png]["time"]
+
+            png_entry = self.pngs[input_png]
+            png_time = png_entry["time"]  # mtime
+
             candidates = []
             for other_mp4, other_data in self.mp4s.items():
                 if other_mp4 == mp4_path:
                     continue
-                dt = abs(other_data["time"] - png_time)
-                if dt < TIME_DELTA and other_data["time"] < png_time:
-                    candidates.append((dt, other_mp4))
+                other_time = other_data["time"]  # mtime
+                dt = abs(other_time - png_time)
+                if dt < TIME_DELTA:
+                    candidates.append((dt, other_time, other_mp4))
+
             if candidates:
-                candidates.sort()
-                predecessor = candidates[0][1]
+                # Pick the one with smallest time difference
+                # If tie, pick the most recent
+                candidates.sort(key=lambda x: (x[0], -x[1]))
+                predecessor = candidates[0][2]
                 self.pred[mp4_path] = predecessor
                 self.succ.setdefault(predecessor, []).append(mp4_path)
 
@@ -137,6 +178,7 @@ class TimelineApp:
         self.root = root
         self.db = VideoDatabase()
         self.thumbnails = {}
+        self.cache = self.load_cache()
         self.current_folders = self.load_config()
 
         self.root.title("ComfyUI Video Timeline – Drag & Drop a Video Here")
@@ -144,7 +186,7 @@ class TimelineApp:
         self.root.configure(bg="#f0f0f0")
 
         # Status bar
-        self.status_var = tk.StringVar(value="Loading configuration...")
+        self.status_var = tk.StringVar(value="Initializing...")
         status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -159,7 +201,7 @@ class TimelineApp:
         ttk.Button(top_frame, text="Add Folder", command=self.add_folder).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="Save & Refresh", command=self.save_and_refresh).pack(side=tk.LEFT, padx=5)
 
-        # Canvas frame
+        # Canvas
         canvas_frame = ttk.Frame(root)
         canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0,10))
 
@@ -175,71 +217,77 @@ class TimelineApp:
         canvas_frame.grid_rowconfigure(0, weight=1)
         canvas_frame.grid_columnconfigure(0, weight=1)
 
-        # Mouse wheel scrolling (cross-platform)
-        self.canvas.bind_all("<MouseWheel>", self.on_mouse_wheel)        # Windows
-        self.canvas.bind_all("<Button-4>", self.on_mouse_wheel)          # Linux scroll up
-        self.canvas.bind_all("<Button-5>", self.on_mouse_wheel)          # Linux scroll down
+        # Mouse wheel
+        self.root.bind_all("<MouseWheel>", self.on_mouse_wheel)
+        self.root.bind_all("<Button-4>", self.on_mouse_wheel)
+        self.root.bind_all("<Button-5>", self.on_mouse_wheel)
 
-        # Drag & Drop on canvas
+        # Drag & Drop
         self.canvas.drop_target_register(DND_FILES)
         self.canvas.dnd_bind('<<Drop>>', self.on_drop)
 
         # Welcome text
-        self.welcome_text = self.canvas.create_text(
+        self.welcome_id = self.canvas.create_text(
             self.root.winfo_screenwidth()//2, 200,
             text="Drag and drop any generated MP4 video here\n"
                  "to build its timeline\n\n"
                  "First add your output folders using the controls above",
-            font=("Arial", 16), fill="gray", anchor="center", tags="welcome"
+            font=("Arial", 16), fill="gray", anchor="center"
         )
 
-        # Auto-refresh on startup
-        if self.current_folders and self.current_folders != ["."]:
+        # Auto-refresh
+        if self.current_folders:
             self.show_progress_popup()
             Thread(target=self.auto_refresh_on_start, daemon=True).start()
+        else:
+            self.status_var.set("Ready – Add folders to begin")
 
     def on_mouse_wheel(self, event):
         if sys.platform == "darwin":
-            scroll_amount = -1 * (event.delta)
-        elif event.num == 4:
-            scroll_amount = -120
-        elif event.num == 5:
-            scroll_amount = 120
+            delta = -event.delta
+        elif hasattr(event, "num"):
+            delta = 120 if event.num == 4 else -120
         else:
-            scroll_amount = -1 * event.delta
-        self.canvas.yview_scroll(int(scroll_amount / 120), "units")
+            delta = -event.delta
+        self.canvas.yview_scroll(int(delta / 120), "units")
 
     def show_progress_popup(self):
         self.progress_popup = tk.Toplevel(self.root)
         self.progress_popup.title("Scanning...")
         self.progress_popup.geometry("300x100")
         self.progress_popup.resizable(False, False)
+        self.progress_popup.configure(bg="#f0f0f0")
         self.progress_popup.transient(self.root)
         self.progress_popup.grab_set()
 
-        label = ttk.Label(self.progress_popup, text="Scanning folders and building graph...")
-        label.pack(pady=15)
-
-        progress = ttk.Progressbar(self.progress_popup, mode="indeterminate", length=200)
+        ttk.Label(self.progress_popup, text="Scanning folders and loading cache...", font=("Arial", 10)).pack(pady=15)
+        progress = ttk.Progressbar(self.progress_popup, mode="indeterminate", length=220)
         progress.pack(pady=10)
-        progress.start()
+        progress.start(10)
 
-        # Center on parent
         self.root.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 150
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 50
-        self.progress_popup.geometry(f"+{x}+{y}")
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        x = (screen_w - 300) // 2
+        y = (screen_h - 100) // 2
+        self.progress_popup.geometry(f"300x100+{x}+{y}")
+        self.progress_popup.lift()
 
     def close_progress_popup(self):
-        if hasattr(self, "progress_popup") and self.progress_popup.winfo_exists():
-            self.progress_popup.destroy()
+        if hasattr(self, "progress_popup"):
+            try:
+                self.progress_popup.destroy()
+            except:
+                pass
 
     def auto_refresh_on_start(self):
-        self.current_folders = [str(Path(f).resolve()) for f in self.current_folders]
-        self.db.scan_folders(self.current_folders)
+        self.db.scan_folders(self.current_folders, self.cache)
+        self.save_cache()
         self.root.after(0, self.close_progress_popup)
-        self.canvas.delete("welcome")
-        self.status_var.set(f"Ready – {len(self.db.mp4s)} videos, {len(self.db.pngs)} last-frames loaded")
+        self.root.after(0, lambda: self.canvas.delete(self.welcome_id))
+        self.root.after(0, lambda: self.status_var.set(
+            f"Ready – {len(self.db.mp4s)} videos, {len(self.db.pngs)} last-frames loaded"
+        ))
 
     def load_config(self):
         if CONFIG_FILE.exists():
@@ -251,6 +299,15 @@ class TimelineApp:
                 pass
         return []
 
+    def load_cache(self):
+        if CACHE_FILE.exists():
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
     def save_config(self):
         folders = [f.strip() for f in self.folder_var.get().split(";") if f.strip()]
         resolved = [str(Path(f).resolve()) for f in folders]
@@ -259,6 +316,13 @@ class TimelineApp:
                 json.dump({"folders": resolved}, f, indent=4)
         except Exception as e:
             messagebox.showerror("Error", f"Could not save config: {e}")
+
+    def save_cache(self):
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.cache, f, indent=4)
+        except Exception:
+            pass
 
     def add_folder(self):
         folder = filedialog.askdirectory()
@@ -272,38 +336,27 @@ class TimelineApp:
     def save_and_refresh(self):
         folders = [f.strip() for f in self.folder_var.get().split(";") if f.strip()]
         if not folders:
-            messagebox.showwarning("Warning", "Please add at least one working folder first.")
+            messagebox.showwarning("Warning", "Add at least one folder first.")
             return
-        self.show_progress_popup()
         self.current_folders = [str(Path(f).resolve()) for f in folders]
         self.save_config()
+        self.show_progress_popup()
         Thread(target=self.perform_scan, daemon=True).start()
 
     def perform_scan(self):
-        self.db.scan_folders(self.current_folders)
+        self.db.scan_folders(self.current_folders, self.cache)
+        self.save_cache()
         self.root.after(0, self.close_progress_popup)
-        self.canvas.delete("welcome")
-        self.status_var.set(f"Ready – {len(self.db.mp4s)} videos, {len(self.db.pngs)} last-frames loaded")
+        self.root.after(0, lambda: self.canvas.delete(self.welcome_id))
+        self.root.after(0, lambda: self.status_var.set(
+            f"Ready – {len(self.db.mp4s)} videos, {len(self.db.pngs)} last-frames loaded"
+        ))
         messagebox.showinfo("Scan Complete", f"Found {len(self.db.mp4s)} videos.")
 
     def on_drop(self, event):
-        self.process_video_path(self.get_dropped_path(event))
-
-    def process_video_path(self, video_path):
-        if not video_path or video_path not in self.db.mp4s:
-            messagebox.showerror("Invalid Video", "Video not found in database. Refresh folders first.")
-            return
-
-        choice = messagebox.askyesno(
-            "Timeline Direction",
-            f"Video: {Path(video_path).name}\n\n"
-            "Yes → Backward chain (to root)\n"
-            "No → Forward tree (continuations)"
-        )
-        if choice:
-            self.show_backward(video_path)
-        else:
-            self.show_forward(video_path)
+        path = self.get_dropped_path(event)
+        if path:
+            self.process_video_path(path)
 
     def get_dropped_path(self, event):
         files = self.root.tk.splitlist(event.data)
@@ -318,9 +371,24 @@ class TimelineApp:
                 current.append(folder)
                 self.folder_var.set("; ".join(current))
                 self.save_and_refresh()
-            else:
-                return None
+            return None
         return path
+
+    def process_video_path(self, video_path):
+        if video_path not in self.db.mp4s:
+            messagebox.showerror("Invalid Video", "Video not found in database. Refresh first.")
+            return
+
+        choice = messagebox.askyesno(
+            "Timeline Direction",
+            f"Video: {Path(video_path).name}\n\n"
+            "Yes → Backward chain\n"
+            "No → Forward tree"
+        )
+        if choice:
+            self.show_backward(video_path)
+        else:
+            self.show_forward(video_path)
 
     def preload_thumbs(self, mp4_list):
         self.thumbnails.clear()
@@ -384,14 +452,18 @@ class TimelineApp:
                 queue.append((child, level + 1))
 
         y_start = 100
-        level_height = 380
+        level_height = 420
         node_positions = {}
         for level, videos in levels.items():
             y = y_start + level * level_height
             num_videos = len(videos)
-            spacing = max(300, 1600 // max(1, num_videos))
+            # Generous minimum spacing per node
+            min_spacing = 450
+            # Use wider canvas area
+            available_width = 2200
+            spacing = max(min_spacing, available_width // max(1, num_videos))
             total_width = (num_videos - 1) * spacing + NODE_WIDTH
-            x_start = max(50, (1600 - total_width) // 2)
+            x_start = max(50, (available_width - total_width) // 2)
             for i, mp4 in enumerate(videos):
                 x = x_start + i * spacing
                 node_positions[mp4] = (x + NODE_WIDTH // 2, y + NODE_HEIGHT // 2)
@@ -404,11 +476,7 @@ class TimelineApp:
             for child in children:
                 if child in node_positions:
                     cx, cy = node_positions[child]
-                    self.canvas.create_line(
-                        px, py + 60,
-                        cx, cy - 60,
-                        arrow=tk.LAST, fill="gray", width=2
-                    )
+                    self.canvas.create_line(px, py + 60, cx, cy - 60, arrow=tk.LAST, fill="gray", width=2)
 
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
@@ -417,6 +485,7 @@ class TimelineApp:
         frame.pack_propagate(False)
         self.canvas.create_window(x, y, window=frame, anchor="nw")
 
+        # Thumbnails
         thumb_frame = ttk.Frame(frame)
         thumb_frame.pack(pady=10)
         first_tk, last_tk = self.thumbnails.get(mp4_path, (None, None))
@@ -429,41 +498,80 @@ class TimelineApp:
             lbl_last.pack(side=tk.LEFT, padx=10)
             lbl_last.bind("<Double-Button-1>", lambda e: self.show_large(mp4_path, False))
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(pady=8, fill=tk.X, padx=15)
+        # Button rows: 3 buttons on top row, 2 on bottom
+        btn_frame_top = ttk.Frame(frame)
+        btn_frame_top.pack(pady=4, fill=tk.X, padx=20)
 
-        ttk.Button(btn_frame, text="Play Video", width=14,
-                   command=lambda: self.play_video(mp4_path)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Preview Up To", width=16,
-                   command=lambda: self.preview_up_to(mp4_path)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Save Combined", width=16,
-                   command=lambda: self.save_combined(mp4_path)).pack(side=tk.LEFT, padx=4)
-        output_png = self.find_output_png(mp4_path)
-        if output_png:
-            ttk.Button(btn_frame, text="Open Last PNG", width=16,
-                       command=lambda: self.open_in_explorer(output_png)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame_top, text="Play Video", width=14,
+                   command=lambda: self.play_video(mp4_path)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame_top, text="Preview Up To", width=16,
+                   command=lambda: self.preview_up_to(mp4_path)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame_top, text="Save Combined", width=16,
+                   command=lambda: self.save_combined(mp4_path)).pack(side=tk.LEFT, padx=5)
 
-        # NEW BUTTON: Use as Input
-        ttk.Button(btn_frame, text="Use as Input", width=14,
-                   command=lambda: self.process_video_path(mp4_path)).pack(side=tk.LEFT, padx=4)
+        btn_frame_bottom = ttk.Frame(frame)
+        btn_frame_bottom.pack(pady=4, fill=tk.X, padx=20)
 
+        ttk.Button(btn_frame_bottom, text="Show in Explorer", width=16,
+                   command=lambda p=mp4_path: self.open_in_explorer(p)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame_bottom, text="Use as Input", width=14,
+                   command=lambda: self.process_video_path(mp4_path)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame_bottom, text="📋 Copy Prompt", width=16,
+                   command=lambda p=mp4_path: self.copy_prompt(p)).pack(side=tk.LEFT, padx=5)
+
+        # Filename label
         ttk.Label(frame, text=Path(mp4_path).name, font=("Arial", 9), foreground="gray", anchor="center").pack(pady=5, fill=tk.X)
 
-    def find_output_png(self, mp4_path):
+    def copy_prompt(self, mp4_path):
         if mp4_path not in self.db.mp4s:
-            return None
+            return
+        workflow = self.db.mp4s[mp4_path].get("workflow")
+        if not workflow:
+            messagebox.showinfo("No Prompt", "No workflow found in this video.")
+            return
+
+        prompt = None
+        for node_id, node in workflow.items():
+            if node.get("class_type") == "CLIPTextEncode" or node.get("class_type") == "Prompt":  # Common prompt nodes
+                prompt = node["inputs"].get("text")
+                if prompt:
+                    break
+            # Fallback: look for node ID "201" as you mentioned
+            if node_id == "201" and "text" in node["inputs"]:
+                prompt = node["inputs"]["text"]
+                break
+
+        if prompt:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(prompt.strip())
+            self.root.update()  # Makes clipboard persist after app closes
+            messagebox.showinfo("Prompt Copied", f"Prompt copied to clipboard!\n\n{prompt[:100]}{'...' if len(prompt) > 100 else ''}")
+        else:
+            messagebox.showinfo("No Prompt", "No text prompt found in workflow.")
+    
+    def find_output_png(self, mp4_path):
+        # Find all successors of this MP4
+        successors = self.db.succ.get(mp4_path, [])
+        if not successors:
+            return None  # No successors → no output PNG (end of chain)
+
+        # Take the input PNG from the first successor
+        first_successor = successors[0]
+        input_png_name = self.db.mp4s.get(first_successor, {}).get("input_png")
+        if input_png_name and input_png_name in self.db.pngs:
+            return self.db.pngs[input_png_name]["path"]
+
+        # Fallback: if something went wrong, try time-based (rare)
         mp4_time = self.db.mp4s[mp4_path]["time"]
-        candidates = [
-            (data["time"], data["path"])
-            for data in self.db.pngs.values()
-            if data["time"] > mp4_time and abs(data["time"] - mp4_time) < TIME_DELTA
-        ]
+        candidates = []
+        for name, data in self.db.pngs.items():
+            if data["time"] > mp4_time and abs(data["time"] - mp4_time) < 180:
+                candidates.append((abs(data["time"] - mp4_time), data["path"]))
         if candidates:
             candidates.sort()
             return candidates[0][1]
-        return None
 
-    # ... (rest of methods: play_video, get_videos_up_to, preview_up_to, save_combined, concat_videos, open_in_explorer, show_large remain the same as previous version)
+        return None
 
     def play_video(self, mp4_path):
         if os.name == "nt":
